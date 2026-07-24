@@ -226,6 +226,7 @@ mod tests {
                 }],
             }),
             bridge: None,
+            certificate: None,
         }
     }
 

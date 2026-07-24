@@ -46,6 +46,7 @@ fn manifest_with(vectors: Vec<EvalVector>, bridge: Option<BridgeSpec>) -> Manife
         files: BTreeMap::new(),
         eval: Some(EvalSpec { engine: "wasi-cmd".into(), vectors }),
         bridge,
+        certificate: None,
     }
 }
 

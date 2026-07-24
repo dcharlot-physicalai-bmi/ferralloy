@@ -30,3 +30,6 @@ serialport = { version = "4", optional = true }
 
 [features]
 serial = ["dep:serialport"]
+
+[dev-dependencies]
+tempfile = "3"

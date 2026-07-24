@@ -1,0 +1,14 @@
+{
+  "kind": "lyapunov-ternary-taylor-crown",
+  "system": "linear-double-integrator",
+  "region": [0.15, 2.0],
+  "alpha": 0.0005,
+  "energy": {
+    "p": [84.186700371440466, 2.2125206355757552, 2.2125206355757534, 9.5185075319851435],
+    "scale": 1.0,
+    "t": [],
+    "b1": [],
+    "w2": [],
+    "v0": 0.0
+  }
+}

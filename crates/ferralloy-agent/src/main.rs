@@ -72,6 +72,8 @@ struct DeployReport {
     #[serde(rename = "static")]
     static_check: String,
     behavior: String,
+    /// Certificate re-verification: "none", "certified (…)", or "REJECTED".
+    certificate: String,
     vectors: Vec<VectorReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -225,6 +227,7 @@ fn accept_pack(app: &App, body: &[u8]) -> DeployReport {
         signer_policy: String::new(),
         static_check: "FAILED".into(),
         behavior: "not-run".into(),
+        certificate: "none".into(),
         vectors: Vec::new(),
         error: None,
     };
@@ -298,6 +301,22 @@ fn accept_pack(app: &App, body: &[u8]) -> DeployReport {
             report.behavior = format!("verified ({} vectors, bit-exact)", report.vectors.len());
         }
         Err(e) => return reject(report, format!("eval: {e}")),
+    }
+
+    // 3.5) Re-prove the formal certificate ON THIS DEVICE before going live — verified
+    //      correctness (the energy still drives the body into its basin), not just verified
+    //      behavior. No SDP/SMT solver; pure arithmetic + tanh, so it runs right here.
+    match &pack.manifest.certificate {
+        None => report.certificate = "none".into(),
+        Some(spec) => match ferralloy_pack::reverify(spec) {
+            Ok(rep) => {
+                report.certificate = format!("certified ({} boxes, worst {:+.5}, {})", rep.boxes, rep.worst_bound, spec.system);
+            }
+            Err(e) => {
+                report.certificate = "REJECTED".into();
+                return reject(report, format!("certificate re-verification failed: {e}"));
+            }
+        },
     }
 
     // 4) Go live atomically: staged dir swaps into packs/<name>.
@@ -676,4 +695,99 @@ fn report_state(
     let _ = agent
         .post(format!("{fleet}/v1/devices/{device_id}/report"))
         .send_json(&body);
+}
+
+#[cfg(test)]
+mod tests {
+    //! The device-side certificate gate: a pushed pack goes live only if the agent can
+    //! re-prove its certificate ON THIS MACHINE. We craft packs directly through the pack
+    //! library (which does NOT re-verify certificates — only the CLI `build` does), so these
+    //! exercise the agent's own gate: a pack a buggy/hostile builder signed with a bad
+    //! certificate is rejected by the device, not merely at build time (defense in depth).
+    use super::*;
+    use ferralloy_pack::{CertificateSpec, KeyPair, PayloadKind, Requires, TernaryEnergy};
+
+    fn certified_spec() -> CertificateSpec {
+        CertificateSpec {
+            kind: "lyapunov-ternary-taylor-crown".into(),
+            system: "saturated-hybrid-wall-contact".into(),
+            region: [0.15, 1.2],
+            alpha: 5e-4,
+            energy: TernaryEnergy {
+                p: [31.988, 2.543, 2.543, 1.4169999999999998],
+                scale: 1.4740514336487223,
+                t: vec![-1, 0, -1, 0, 0, 0, -1, -1, -1, 0, 1, 1, 1, 0, 0, 0],
+                b1: vec![-1.7253050443315214, -1.6895583892614585, -1.572812794286765, -2.9962607818256326,
+                         -1.362285297766529, 2.9948712315814445, 1.6641829682841895, 0.15496976355688338],
+                w2: vec![-1.8092778484049137, -0.6474111753241604, -0.0407591631059273, 1.2424339130389697,
+                         -0.3175122724570142, -1.1023667519975417, 0.6676446220380198, -5.977279221172131e-12],
+                v0: 0.9069008854718814,
+            },
+        }
+    }
+
+    fn make_app(root: &std::path::Path) -> App {
+        fs::create_dir_all(root.join("packs")).unwrap();
+        App {
+            inner: Arc::new(Mutex::new(AgentState { packs: BTreeMap::new() })),
+            root: Arc::new(root.to_path_buf()),
+        }
+    }
+
+    fn pack_bytes(dir: &std::path::Path, cert: Option<CertificateSpec>) -> Vec<u8> {
+        let payload = dir.join("payload-src");
+        fs::create_dir_all(&payload).unwrap();
+        fs::write(payload.join("policy.wasm"), b"\0asm-placeholder-policy").unwrap();
+        let manifest = Manifest {
+            fpack: ferralloy_pack::FPACK_VERSION,
+            name: "reach".into(),
+            version: "0.1.0".into(),
+            kind: PayloadKind::Wasm,
+            entry: "payload/policy.wasm".into(),
+            requires: Requires::default(),
+            files: BTreeMap::new(),
+            eval: None,
+            bridge: None,
+            certificate: cert,
+        };
+        let key = KeyPair::from_seed_hex(&"33".repeat(32)).unwrap();
+        let out = dir.join("p.fpack");
+        ferralloy_pack::build(&payload, manifest, &key, &out).unwrap();
+        fs::read(&out).unwrap()
+    }
+
+    #[test]
+    fn device_accepts_a_valid_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = make_app(dir.path());
+        let report = accept_pack(&app, &pack_bytes(dir.path(), Some(certified_spec())));
+        assert!(report.error.is_none(), "expected accept, got error {:?}", report.error);
+        assert!(report.certificate.starts_with("certified"), "certificate field = {:?}", report.certificate);
+        // and it actually went live
+        assert!(app.inner.lock().unwrap().packs.contains_key("reach"));
+    }
+
+    #[test]
+    fn device_rejects_a_bad_certificate_before_going_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = make_app(dir.path());
+        let mut spec = certified_spec();
+        spec.energy.w2[0] = 5.0; // a corrupted weight — no longer a valid certificate
+        let report = accept_pack(&app, &pack_bytes(dir.path(), Some(spec)));
+        assert!(report.error.is_some(), "expected the device to reject the pack");
+        assert_eq!(report.certificate, "REJECTED");
+        // static verification passed — it's the certificate gate that stopped it
+        assert_eq!(report.static_check, "ok");
+        // and nothing went live
+        assert!(!app.inner.lock().unwrap().packs.contains_key("reach"));
+    }
+
+    #[test]
+    fn device_accepts_a_pack_with_no_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = make_app(dir.path());
+        let report = accept_pack(&app, &pack_bytes(dir.path(), None));
+        assert!(report.error.is_none(), "plain packs must still be accepted");
+        assert_eq!(report.certificate, "none");
+    }
 }
