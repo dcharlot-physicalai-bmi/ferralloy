@@ -87,6 +87,12 @@ pub struct Manifest {
     /// (field is skipped, so pre-bridge manifests' canonical bytes are unchanged).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge: Option<BridgeSpec>,
+    /// Verified-correctness facet — a formal Lyapunov certificate the device
+    /// re-proves before trusting the pack (see [`crate::certificate`]). Absent
+    /// for packs that carry only behavior vectors (skipped ⇒ canonical bytes of
+    /// pre-certificate manifests are unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<crate::certificate::CertificateSpec>,
 }
 
 impl Manifest {

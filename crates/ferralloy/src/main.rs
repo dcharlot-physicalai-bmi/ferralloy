@@ -70,6 +70,10 @@ enum Cmd {
         /// Bus servo IDs for the bridge target (comma-separated, e.g. 1,2,3)
         #[arg(long = "bridge-ids", value_delimiter = ',')]
         bridge_ids: Vec<u8>,
+        /// Attach a formal Lyapunov certificate (JSON) the device re-proves before
+        /// trusting the pack — verified correctness, not just verified behavior.
+        #[arg(long)]
+        certificate: Option<PathBuf>,
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
@@ -77,6 +81,9 @@ enum Cmd {
     Inspect { fpack: PathBuf },
     /// Statically verify a pack, then re-run its eval vectors locally
     Verify { fpack: PathBuf },
+    /// Re-prove a pack's formal Lyapunov certificate on THIS machine (no solver).
+    /// Same check the device runs before trusting the pack — verified correctness.
+    VerifyCert { fpack: PathBuf },
     /// Browse the LAN/tailnet for ferralloyd agents (mDNS)
     Discover {
         #[arg(long, default_value_t = 3)]
@@ -141,6 +148,24 @@ enum Cmd {
         channel: String,
         #[arg(long)]
         fleet: String,
+        /// Stage as a canary to N% of the channel's devices instead of
+        /// replacing the current release. Promote or abort afterward.
+        #[arg(long)]
+        canary: Option<u8>,
+    },
+    /// Promote a channel's in-flight canary to the fleet-wide release.
+    Promote {
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        #[arg(long)]
+        fleet: String,
+    },
+    /// Abort a channel's canary — its devices revert to the current release.
+    Abort {
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        #[arg(long)]
+        fleet: String,
     },
     /// Show a fleet server's channels and device fleet as JSON.
     Fleet {
@@ -152,11 +177,12 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Keygen { force } => keygen(force),
-        Cmd::Build { payload_dir, name, version, entry, engine, wasi, cap, vec_str, vec_hex, bridge, bridge_ids, out } => {
-            build(payload_dir, name, version, entry, engine, wasi, cap, vec_str, vec_hex, bridge, bridge_ids, out)
+        Cmd::Build { payload_dir, name, version, entry, engine, wasi, cap, vec_str, vec_hex, bridge, bridge_ids, certificate, out } => {
+            build(payload_dir, name, version, entry, engine, wasi, cap, vec_str, vec_hex, bridge, bridge_ids, certificate, out)
         }
         Cmd::Inspect { fpack } => inspect(&fpack),
         Cmd::Verify { fpack } => verify(&fpack),
+        Cmd::VerifyCert { fpack } => verify_cert(&fpack),
         Cmd::Discover { secs } => discover(secs),
         Cmd::Deploy { fpack, to } => deploy(&fpack, &to),
         Cmd::Info { to } => http_get(&to, "/v1/info"),
@@ -164,21 +190,33 @@ fn main() -> Result<()> {
         Cmd::Stop { name, to } => http_post(&to, &format!("/v1/packs/{name}/stop"), &[]),
         Cmd::Logs { name, to } => http_get(&to, &format!("/v1/packs/{name}/logs")),
         Cmd::Run { project, to, input, name } => run(project, &to, &input, name),
-        Cmd::Release { fpack, channel, fleet } => release(&fpack, &channel, &fleet),
+        Cmd::Release { fpack, channel, fleet, canary } => release(&fpack, &channel, &fleet, canary),
+        Cmd::Promote { channel, fleet } => http_post_abs(&format!("{}/v1/channels/{channel}/promote", fleet.trim_end_matches('/')), &[]),
+        Cmd::Abort { channel, fleet } => http_post_abs(&format!("{}/v1/channels/{channel}/abort", fleet.trim_end_matches('/')), &[]),
         Cmd::Fleet { fleet } => http_get_abs(&format!("{}/v1/fleet", fleet.trim_end_matches('/'))),
     }
 }
 
 /// `ferralloy release` — publish a signed pack to a fleet channel. Verifies it
 /// locally first (fail here, not on the server), then PUTs the bytes.
-fn release(fpack: &PathBuf, channel: &str, fleet: &str) -> Result<()> {
+fn release(fpack: &PathBuf, channel: &str, fleet: &str, canary: Option<u8>) -> Result<()> {
     let pack = ferralloy_pack::load(fpack)?;
     ferralloy_pack::verify(&pack)?;
+    check_certificate(&pack)?;
     let bytes = fs::read(fpack)?;
     let fleet = fleet.trim_end_matches('/');
-    println!("releasing {} v{} → {fleet} channel={channel}", pack.manifest.name, pack.manifest.version);
+    let url = match canary {
+        Some(p) => {
+            println!("canary {}% {} v{} → {fleet} channel={channel}", p, pack.manifest.name, pack.manifest.version);
+            format!("{fleet}/v1/channels/{channel}?canary={p}")
+        }
+        None => {
+            println!("releasing {} v{} → {fleet} channel={channel}", pack.manifest.name, pack.manifest.version);
+            format!("{fleet}/v1/channels/{channel}")
+        }
+    };
     let mut resp = agent()
-        .put(format!("{fleet}/v1/channels/{channel}"))
+        .put(url)
         .content_type("application/vnd.ferralloy.fpack")
         .send(&bytes[..])?;
     let status = resp.status();
@@ -253,6 +291,7 @@ fn run(project: PathBuf, to: &str, input: &str, name: Option<String>) -> Result<
         vec![],
         None,
         vec![],
+        None,
         Some(fpack.clone()),
     )?;
     let t_pack = t1.elapsed();
@@ -348,9 +387,23 @@ fn build(
     vec_hex: Vec<String>,
     bridge: Option<String>,
     bridge_ids: Vec<u8>,
+    certificate_path: Option<PathBuf>,
     out: Option<PathBuf>,
 ) -> Result<()> {
     let key = load_key()?;
+    // Load + re-verify any attached certificate NOW: fail at build time, not on the device.
+    let certificate = match certificate_path {
+        Some(p) => {
+            let spec: ferralloy_pack::CertificateSpec =
+                serde_json::from_slice(&fs::read(&p).with_context(|| format!("reading certificate {}", p.display()))?)
+                    .context("parsing certificate JSON")?;
+            let rep = ferralloy_pack::reverify(&spec).context("certificate does not re-verify")?;
+            println!("certificate: CERTIFIED ({} boxes, worst bound {:+.5}) — system {}, region {:?}",
+                rep.boxes, rep.worst_bound, spec.system, spec.region);
+            Some(spec)
+        }
+        None => None,
+    };
     let requires = Requires { wasi, caps: cap };
     let bridge = bridge.map(|target| ferralloy_pack::BridgeSpec {
         target,
@@ -394,6 +447,7 @@ fn build(
         files: BTreeMap::new(),
         eval,
         bridge,
+        certificate,
     };
     let out = out.unwrap_or_else(|| PathBuf::from(format!("{name}-{version}.fpack")));
     ferralloy_pack::build(&payload_dir, manifest, &key, &out)?;
@@ -436,6 +490,45 @@ fn verify(fpack: &PathBuf) -> Result<()> {
         bail!("behavioral verification FAILED");
     }
     println!("behavior: all {} vector(s) match the signed outputs", results.len());
+    check_certificate(&pack)?;
+    Ok(())
+}
+
+/// `ferralloy verify-cert` — re-prove the pack's certificate on this machine (no solver),
+/// exactly as the device does before trusting it.
+fn verify_cert(fpack: &PathBuf) -> Result<()> {
+    let pack = ferralloy_pack::load(fpack)?;
+    ferralloy_pack::verify(&pack)?;
+    match &pack.manifest.certificate {
+        None => {
+            println!("certificate: pack carries no certificate");
+            Ok(())
+        }
+        Some(spec) => match ferralloy_pack::reverify(spec) {
+            Ok(rep) => {
+                println!(
+                    "certificate: CERTIFIED — {} carries a valid Lyapunov certificate over region {:?}\n  system {}, {} boxes, depth {}, worst ΔV+α‖e‖² bound {:+.5} (< 0 ⇒ sound)",
+                    pack.manifest.name, spec.region, spec.system, rep.boxes, rep.depth, rep.worst_bound,
+                );
+                println!("  → ACCEPT: a device would trust this pack's correctness.");
+                Ok(())
+            }
+            Err(e) => bail!("certificate REJECTED — {e}"),
+        },
+    }
+}
+
+/// The certificate gate, shared by verify/deploy/release: if the pack carries a certificate,
+/// re-prove it here and refuse to proceed if it does not hold. Packs without one are unaffected.
+fn check_certificate(pack: &ferralloy_pack::LoadedPack) -> Result<()> {
+    if let Some(spec) = &pack.manifest.certificate {
+        let rep = ferralloy_pack::reverify(spec)
+            .with_context(|| format!("certificate gate: {} v{} REJECTED", pack.manifest.name, pack.manifest.version))?;
+        println!(
+            "certificate: re-proven ({} boxes, worst bound {:+.5}, system {})",
+            rep.boxes, rep.worst_bound, spec.system,
+        );
+    }
     Ok(())
 }
 
@@ -482,6 +575,7 @@ fn deploy(fpack: &PathBuf, to: &str) -> Result<()> {
     // Refuse to ship a pack that doesn't verify locally — fail here, not on-device.
     let pack = ferralloy_pack::load(fpack)?;
     ferralloy_pack::verify(&pack)?;
+    check_certificate(&pack)?;
     let bytes = fs::read(fpack)?;
     println!("deploying {} ({} bytes) → {to}", fpack.display(), bytes.len());
     let mut resp = agent()
@@ -514,6 +608,18 @@ fn http_get_abs(url: &str) -> Result<()> {
     let status = resp.status();
     let body = resp.body_mut().read_to_string()?;
     print_report(&body);
+    if !status.is_success() {
+        bail!("HTTP {status}");
+    }
+    Ok(())
+}
+
+/// POST a fully-qualified URL (fleet endpoints carry their own scheme/host).
+fn http_post_abs(url: &str, body: &[u8]) -> Result<()> {
+    let mut resp = agent().post(url).send(body)?;
+    let status = resp.status();
+    let text = resp.body_mut().read_to_string()?;
+    print_report(&text);
     if !status.is_success() {
         bail!("HTTP {status}");
     }

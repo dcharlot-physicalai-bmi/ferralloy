@@ -614,7 +614,7 @@ fn fleet_tick(
 ) -> Result<(), String> {
     // 1) what should this channel be running?
     let mut resp = agent
-        .get(format!("{fleet}/v1/channels/{channel}"))
+        .get(format!("{fleet}/v1/channels/{channel}?device={device_id}"))
         .call()
         .map_err(|e| e.to_string())?;
     if resp.status() == 404 {
@@ -634,7 +634,7 @@ fn fleet_tick(
 
     // 3) pull the pack, integrity-check the transfer, run the accept gate.
     let pack_bytes = agent
-        .get(format!("{fleet}/v1/channels/{channel}/pack"))
+        .get(format!("{fleet}/v1/channels/{channel}/pack?device={device_id}"))
         .call()
         .map_err(|e| e.to_string())?
         .body_mut()

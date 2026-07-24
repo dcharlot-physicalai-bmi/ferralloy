@@ -18,7 +18,7 @@
 //! fleet. This is the reference server; a production one would add cohorts,
 //! staged canaries, and TUF-rooted keys (all planned, all open).
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, put};
@@ -55,10 +55,47 @@ struct DeviceReport {
     seen: u64,
 }
 
+/// A staged (canary) rollout: a new release going to a fraction of a channel's
+/// devices while the rest stay on `current`. Promotion is an operator decision,
+/// ideally made from the canary's VERIFIED-behavior pass rate (the dashboard).
+#[derive(Clone, Serialize, Deserialize)]
+struct Rollout {
+    release: Release,
+    /// 0..=100 — a device runs the rollout iff its stable percentile < percent.
+    percent: u8,
+}
+
+/// A channel's state: the current release plus an optional in-flight rollout.
+#[derive(Clone, Serialize, Deserialize)]
+struct Channel {
+    current: Release,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollout: Option<Rollout>,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct FleetState {
-    channels: BTreeMap<String, Release>,
+    channels: BTreeMap<String, Channel>,
     devices: BTreeMap<String, DeviceReport>,
+}
+
+/// Deterministic 0..=99 bucket for a device id — FNV-1a mod 100. Stable across
+/// polls and servers, so a device stays in or out of a canary consistently.
+fn pctl(device: &str) -> u8 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in device.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    (h % 100) as u8
+}
+
+/// Which release this device should run on the channel, honoring the canary.
+fn resolve<'a>(ch: &'a Channel, device: &str) -> &'a Release {
+    match &ch.rollout {
+        Some(r) if pctl(device) < r.percent => &r.release,
+        _ => &ch.current,
+    }
 }
 
 #[derive(Clone)]
@@ -108,6 +145,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/fleet", get(fleet_json))
         .route("/v1/channels/{ch}", put(set_channel).get(get_channel))
         .route("/v1/channels/{ch}/pack", get(get_pack))
+        .route("/v1/channels/{ch}/promote", axum::routing::post(promote))
+        .route("/v1/channels/{ch}/abort", axum::routing::post(abort))
         .route("/v1/devices/{id}/report", axum::routing::post(post_report))
         .with_state(app)
         .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024));
@@ -129,13 +168,21 @@ fn persist(app: &App, st: &FleetState) {
     );
 }
 
-/// PUT a `.fpack` as a channel's release. The pack is statically verified
-/// (signature + digests) before it can become a target — the fleet plane never
-/// serves an artifact it hasn't validated.
-async fn set_channel(State(app): State<App>, Path(ch): Path<String>, body: axum::body::Bytes) -> Response {
+/// PUT a `.fpack` as a channel's release. Statically verified (signature +
+/// digests) before it can become a target — the fleet plane never serves an
+/// artifact it hasn't validated. `?canary=<N>` stages it as a rollout to N% of
+/// the channel's devices instead of replacing `current`; without it, the
+/// release becomes `current` and any in-flight rollout is cleared.
+async fn set_channel(
+    State(app): State<App>,
+    Path(ch): Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    body: axum::body::Bytes,
+) -> Response {
     if ch.contains(['/', '.']) {
         return (StatusCode::BAD_REQUEST, "bad channel name").into_response();
     }
+    let canary: Option<u8> = q.get("canary").and_then(|s| s.parse().ok()).map(|p: u8| p.min(100));
     let tmp = app.root.join("channels").join(format!("{ch}.incoming"));
     if let Err(e) = fs::write(&tmp, &body) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("io: {e}")).into_response();
@@ -155,30 +202,96 @@ async fn set_channel(State(app): State<App>, Path(ch): Path<String>, body: axum:
         signer,
         published: now(),
     };
-    let final_path = app.root.join("channels").join(format!("{ch}.fpack"));
-    if let Err(e) = fs::rename(&tmp, &final_path) {
+    // canary pack stored alongside current so both can be served per-device
+    let slot = if canary.is_some() { format!("{ch}.rollout.fpack") } else { format!("{ch}.fpack") };
+    if let Err(e) = fs::rename(&tmp, app.root.join("channels").join(&slot)) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {e}")).into_response();
     }
     let mut st = app.inner.lock().unwrap();
-    st.channels.insert(ch.clone(), rel.clone());
+    let msg = match canary {
+        Some(p) => {
+            match st.channels.get_mut(&ch) {
+                Some(c) => { c.rollout = Some(Rollout { release: rel.clone(), percent: p }); }
+                None => return (StatusCode::BAD_REQUEST, "cannot canary an empty channel — set a current release first").into_response(),
+            }
+            serde_json::json!({ "channel": ch, "canary": rel, "percent": p })
+        }
+        None => {
+            st.channels.insert(ch.clone(), Channel { current: rel.clone(), rollout: None });
+            let _ = fs::remove_file(app.root.join("channels").join(format!("{ch}.rollout.fpack")));
+            serde_json::json!({ "channel": ch, "released": rel })
+        }
+    };
     persist(&app, &st);
-    (StatusCode::OK, Json(serde_json::json!({ "channel": ch, "released": rel }))).into_response()
+    (StatusCode::OK, Json(msg)).into_response()
 }
 
-async fn get_channel(State(app): State<App>, Path(ch): Path<String>) -> Response {
+/// Promote the in-flight rollout to `current` (the canary becomes the fleet-
+/// wide release). Operator action — run it once the canary's pass rate is good.
+async fn promote(State(app): State<App>, Path(ch): Path<String>) -> Response {
+    let mut st = app.inner.lock().unwrap();
+    let Some(c) = st.channels.get_mut(&ch) else {
+        return (StatusCode::NOT_FOUND, "no such channel").into_response();
+    };
+    let Some(r) = c.rollout.take() else {
+        return (StatusCode::BAD_REQUEST, "no rollout to promote").into_response();
+    };
+    c.current = r.release.clone();
+    let _ = fs::rename(
+        app.root.join("channels").join(format!("{ch}.rollout.fpack")),
+        app.root.join("channels").join(format!("{ch}.fpack")),
+    );
+    persist(&app, &st);
+    (StatusCode::OK, Json(serde_json::json!({ "channel": ch, "promoted": r.release }))).into_response()
+}
+
+/// Abort the in-flight rollout — canary devices revert to `current` next poll.
+async fn abort(State(app): State<App>, Path(ch): Path<String>) -> Response {
+    let mut st = app.inner.lock().unwrap();
+    let Some(c) = st.channels.get_mut(&ch) else {
+        return (StatusCode::NOT_FOUND, "no such channel").into_response();
+    };
+    let had = c.rollout.take().is_some();
+    let _ = fs::remove_file(app.root.join("channels").join(format!("{ch}.rollout.fpack")));
+    persist(&app, &st);
+    (StatusCode::OK, Json(serde_json::json!({ "channel": ch, "aborted": had }))).into_response()
+}
+
+async fn get_channel(
+    State(app): State<App>,
+    Path(ch): Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
     let st = app.inner.lock().unwrap();
-    match st.channels.get(&ch) {
-        Some(r) => Json(r).into_response(),
-        None => (StatusCode::NOT_FOUND, "no release on this channel").into_response(),
+    let Some(c) = st.channels.get(&ch) else {
+        return (StatusCode::NOT_FOUND, "no release on this channel").into_response();
+    };
+    // With ?device, resolve to that device's release (honors the canary);
+    // without it, report the full channel state (operator view).
+    match q.get("device") {
+        Some(dev) => Json(resolve(c, dev)).into_response(),
+        None => Json(c).into_response(),
     }
 }
 
-async fn get_pack(State(app): State<App>, Path(ch): Path<String>) -> Response {
+async fn get_pack(
+    State(app): State<App>,
+    Path(ch): Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
     if ch.contains(['/', '.']) {
         return (StatusCode::BAD_REQUEST, "bad channel name").into_response();
     }
-    let path = app.root.join("channels").join(format!("{ch}.fpack"));
-    match fs::read(&path) {
+    // Serve the canary pack only to devices the canary covers.
+    let on_canary = {
+        let st = app.inner.lock().unwrap();
+        match (q.get("device"), st.channels.get(&ch)) {
+            (Some(dev), Some(c)) => c.rollout.as_ref().is_some_and(|r| pctl(dev) < r.percent),
+            _ => false,
+        }
+    };
+    let slot = if on_canary { format!("{ch}.rollout.fpack") } else { format!("{ch}.fpack") };
+    match fs::read(app.root.join("channels").join(&slot)) {
         Ok(bytes) => (
             [(axum::http::header::CONTENT_TYPE, "application/vnd.ferralloy.fpack")],
             bytes,
@@ -206,11 +319,26 @@ async fn dashboard(State(app): State<App>) -> Html<String> {
     let st = app.inner.lock().unwrap();
     let t = now();
     let mut chan_rows = String::new();
-    for (name, r) in &st.channels {
+    for (name, c) in &st.channels {
+        let r = &c.current;
         chan_rows.push_str(&format!(
-            "<tr><td><b>{name}</b></td><td>{}</td><td>{}</td><td class=m>{}…</td><td class=m>{}…</td></tr>",
-            r.name, r.version, &r.sha256[..r.sha256.len().min(12)], &r.signer[..r.signer.len().min(12)]
+            "<tr><td><b>{name}</b></td><td>{}</td><td class=m>{}…</td><td colspan=2 class=dim>current</td></tr>",
+            r.version, &r.sha256[..r.sha256.len().min(12)]
         ));
+        if let Some(ro) = &c.rollout {
+            // canary health from device reports: of devices whose target_sha is
+            // the canary's, how many verified? This is the promotion signal.
+            let on: Vec<_> = st.devices.values()
+                .filter(|d| d.channel == *name && d.target_sha == ro.release.sha256).collect();
+            let ok = on.iter().filter(|d| d.ok).count();
+            let health = if on.is_empty() { "no reports yet".to_string() }
+                else { format!("{ok}/{} verified", on.len()) };
+            let cls = if !on.is_empty() && ok == on.len() { "ok" } else if on.iter().any(|d| !d.ok) { "bad" } else { "dim" };
+            chan_rows.push_str(&format!(
+                "<tr><td class=dim>└ canary</td><td>{}</td><td class=m>{}…</td><td>{}%</td><td class={cls}>{health}</td></tr>",
+                ro.release.version, &ro.release.sha256[..ro.release.sha256.len().min(12)], ro.percent
+            ));
+        }
     }
     if chan_rows.is_empty() {
         chan_rows = "<tr><td colspan=5 class=dim>no channels yet — <span class=m>ferralloy release &lt;pack&gt; --channel stable --fleet …</span></td></tr>".into();
@@ -241,7 +369,7 @@ async fn dashboard(State(app): State<App>) -> Html<String> {
 <h1><b>Φ</b> Ferralloy Fleet</h1>
 <p class=sub>Open fleet plane · a device shows here only after it VERIFIES a release's behavior on-device. Rolled out = verified, not delivered.</p>
 <h2>Channels</h2>
-<table><tr><th>channel</th><th>pack</th><th>version</th><th>sha256</th><th>signer</th></tr>{chan_rows}</table>
+<table><tr><th>channel</th><th>version</th><th>sha256</th><th>rollout</th><th>canary health</th></tr>{chan_rows}</table>
 <h2>Devices</h2>
 <table><tr><th>device</th><th>platform</th><th>channel</th><th>version</th><th>behavior</th><th>last seen</th></tr>{dev_rows}</table>
 "#

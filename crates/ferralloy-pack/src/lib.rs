@@ -14,10 +14,12 @@
 //! a pack that requests no clock/random/net cannot act nondeterministically.
 
 pub mod archive;
+pub mod certificate;
 pub mod manifest;
 pub mod sign;
 
 pub use archive::{LoadedPack, build, extract, load, verify};
+pub use certificate::{CertError, CertReport, CertificateSpec, TernaryEnergy, reverify};
 pub use manifest::{BridgeSpec, EvalSpec, EvalVector, FPACK_VERSION, Manifest, PayloadKind, Requires};
 pub use sign::{KeyPair, SignatureBlock};
 
