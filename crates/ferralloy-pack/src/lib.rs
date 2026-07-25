@@ -13,14 +13,18 @@
 //! the output digest. Deny-by-default capability grants make that check sound —
 //! a pack that requests no clock/random/net cannot act nondeterministically.
 
+#[cfg(feature = "native")]
 pub mod archive;
 pub mod certificate;
 pub mod manifest;
+#[cfg(feature = "native")]
 pub mod sign;
 
+#[cfg(feature = "native")]
 pub use archive::{LoadedPack, build, extract, load, verify};
 pub use certificate::{CertError, CertReport, CertificateSpec, TernaryEnergy, reverify};
 pub use manifest::{BridgeSpec, EvalSpec, EvalVector, FPACK_VERSION, Manifest, PayloadKind, Requires};
+#[cfg(feature = "native")]
 pub use sign::{KeyPair, SignatureBlock};
 
 use sha2::{Digest, Sha256};

@@ -12,11 +12,19 @@ categories = ["embedded", "cryptography"]
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-ed25519-dalek.workspace = true
-getrandom.workspace = true
 hex.workspace = true
-tar.workspace = true
 thiserror.workspace = true
+# native-only: signing (ed25519 + getrandom) and the tar archive. Gated behind the
+# default `native` feature so the certificate re-verifier builds for wasm32-unknown-unknown
+# (the browser target) with `--no-default-features` — no getrandom, no filesystem, no crypto.
+ed25519-dalek = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+
+[features]
+default = ["native"]
+# pack build/load/verify + ed25519 signing + tar archive (everything except the pure verifier).
+native = ["dep:ed25519-dalek", "dep:getrandom", "dep:tar"]
 
 [dev-dependencies]
 tempfile = "3"
